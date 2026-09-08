@@ -1,0 +1,23 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Models & binaries
+models/
+*.bin
+*.dll
+*.exe
+*.zip
+
+# Audio recordings & output files
+*.wav
+*.mp4
+*.mp3
+MeetingRecordings/
+
+# Cache & tracking
+__pycache__/
+*.pyc
+.processed_meetings.json
+cs/
