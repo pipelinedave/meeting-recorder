@@ -1,17 +1,21 @@
-# Roadmap: Meeting-Recorder Multi-Speaker Alignment
+# Roadmap & Status: Meeting-Recorder Multi-Speaker Alignment
 
 ## Hintergrund (Ideenaustausch Yannick Bülter & David Hallmann, 10.09.2026)
 
-Das aktuelle Setup trennt Stereo-Hardwarekanäle:
-- Kanal 1 = David
+Das Basissystem trennt Stereo-Hardwarekanäle:
+- Kanal 1 = David (Mikrofon)
 - Kanal 2 = Gegenseite (gesamter Loopback)
 
-## Ziel: Echte Sprechernamen für die Gegenseite ohne Cloud-Diarisierung
+## Status: Umgesetzt (11.09.2026) ✅
 
 In Kombination mit `teams-mcp`:
 1. **Meeting-Metadaten & Sprecher-Timeline:**
-   `teams-mcp` liefert optional eine `*.speakers.json` (Start- und Endzeitpunkte, an denen bestimmte Personen im Teams-Browserclient gesprochen haben, ermittelt über die grünen Sprecherrahmen im DOM).
-2. **Post-Processing in `transcribe_dual.py`:**
-   - Wenn `*.speakers.json` für die Aufnahme vorliegt, mappt `transcribe_dual.py` die Segmente von Kanal 2 auf die Zeitbereiche der aktiven Sprecher.
-   - Resultat: Statt generischem `**Gegenseite / Kunde:**` steht im Markdown-Transkript automatisch z.B. `**Yannick Bülter:**`, `**Pierre:**`, `**Kunde X:**`.
-   - Bei Überschneidungen oder fehlendem DOM-Match greift der bewährte Fallback `Gegenseite` / Diarisierung.
+   `teams-mcp` liefert eine `*.speakers.json` (Start- und Endzeitpunkte aktiver Sprecher über DOM-Polling sowie Spontan-Call 1:1 Matching).
+2. **Post-Processing & Alignment in `transcribe_dual.py`:**
+   - Robuste VAD-Clusterung via Silero VAD (verhindert das Verschmelzen von isolierten Einwürfen).
+   - Segmente von Kanal 2 werden mit der DOM-Timeline abgeglichen (`align_segments_with_timeline`).
+   - 1:1 Anrufe werden automatisch zu 100% dem Gesprächspartner zugeordnet.
+   - Aufeinanderfolgende Segmente desselben Sprechers werden zu zusammenhängenden Absätzen gebündelt.
+   - Resultat: Konkrete Sprechernamen (`**Stefan Maciolek:**`, `**Robert Lábas:**`, `**Niklas Brunnenkant:**`, `**Theys Schiller:**`).
+3. **Signal-Datei (.stop) Shutdown:**
+   PowerShell und Node-Hintergrundprozess kommunizieren über `$speakersFile.stop`, womit die Timeline vor dem Transkriptionsstart vollständig finalisiert wird.
