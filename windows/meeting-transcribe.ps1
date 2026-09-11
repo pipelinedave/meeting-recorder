@@ -50,11 +50,16 @@ $null = Read-Host
 Write-Host "`n[*] Stoppe Aufnahme und finalisiere Audio-Datei..." -ForegroundColor Cyan
 $recorder.Stop()
 
-# Teams Speaker Tracking beenden
+# Teams Speaker Tracking geordnet beenden (via Signaldatei)
 if ($trackerJob) {
+    Write-Host "[*] Finalisiere Sprecher-Timeline..." -ForegroundColor Cyan
+    $stopFile = "$speakersFile.stop"
+    Set-Content -Path $stopFile -Value "stop" -Force
+    # Warte bis zu 5 Sekunden, dass der Tracker sauber exportiert
+    Wait-Job $trackerJob -Timeout 5 | Out-Null
     Stop-Job $trackerJob -ErrorAction SilentlyContinue | Out-Null
     Remove-Job $trackerJob -ErrorAction SilentlyContinue | Out-Null
-    wsl -e bash -ilc "node ~/projects/teams-mcp/bin/track-speakers.js stop" 2>$null | Out-Null
+    if (Test-Path $stopFile) { Remove-Item $stopFile -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host "`n[*] Starte Whisper GPU Transkription und Sprechertrennung..." -ForegroundColor Cyan

@@ -6,13 +6,21 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
+from faster_whisper.vad import get_speech_timestamps
 
 # Ensure NVIDIA CUDA libraries in venv are visible to CTranslate2
 try:
     import nvidia
+
     nv_base = nvidia.__path__[0]
-    extra_libs = [os.path.join(root, "lib") for root, dirs, files in os.walk(nv_base) if "lib" in dirs]
-    os.environ["LD_LIBRARY_PATH"] = ":".join(extra_libs) + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    extra_libs = [
+        os.path.join(root, "lib")
+        for root, dirs, files in os.walk(nv_base)
+        if "lib" in dirs
+    ]
+    os.environ["LD_LIBRARY_PATH"] = (
+        ":".join(extra_libs) + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    )
 except Exception as e:
     pass
 
@@ -22,40 +30,127 @@ INITIAL_PROMPT = (
     "CMIS, REST API, JSON, SQLite, Docker, Windows, David, Mathis, Pierre, Yannick, Ticket, DL-Beleg."
 )
 
+
 def format_timestamp(seconds):
     m = int(seconds // 60)
     s = int(seconds % 60)
     return f"{m:02d}:{s:02d}"
 
-def transcribe_channel(model, audio_data, sample_rate, speaker_label):
-    print(f"[*] Transkribiere Spur: {speaker_label}...")
-    segments, info = model.transcribe(
-        audio_data,
-        language="de",
-        initial_prompt=INITIAL_PROMPT,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400),
-        beam_size=5,
-        repetition_penalty=1.2,
-        no_speech_threshold=0.6
-    )
-    
-    results = []
-    for seg in segments:
-        text = seg.text.strip()
-        if not text:
-            continue
-        seg_duration = seg.end - seg.start
-        if seg_duration > 15 and text in ["Vielen Dank.", "Untertitelung aufgrund der Amara.org-Community", "Danke fürs Zuschauen!"]:
-            continue
 
-        results.append({
-            "speaker": speaker_label,
-            "start": seg.start,
-            "end": seg.end,
-            "text": text
-        })
+def transcribe_channel(model, audio_data, sample_rate, speaker_label):
+    print(
+        f"[*] Transkribiere Spur: {speaker_label} (VAD-Clusterung & Faster-Whisper)..."
+    )
+    timestamps = get_speech_timestamps(
+        audio_data, min_silence_duration_ms=400, speech_pad_ms=200
+    )
+    if not timestamps:
+        return []
+
+    # Cluster nah beieinander liegende Sprach-Chunks (< 1.2s Pause) zusammen
+    clusters = []
+    curr_start = timestamps[0]["start"]
+    curr_end = timestamps[0]["end"]
+
+    for ts in timestamps[1:]:
+        gap = (ts["start"] - curr_end) / sample_rate
+        if gap < 1.2:
+            curr_end = ts["end"]
+        else:
+            clusters.append((curr_start, curr_end))
+            curr_start = ts["start"]
+            curr_end = ts["end"]
+    clusters.append((curr_start, curr_end))
+
+    results = []
+    pad = int(0.25 * sample_rate)
+    for c_start, c_end in clusters:
+        s_sec = c_start / sample_rate
+        e_sec = c_end / sample_rate
+        dur = e_sec - s_sec
+        s_idx = max(0, c_start - pad)
+        e_idx = min(len(audio_data), c_end + pad)
+        chunk = audio_data[s_idx:e_idx]
+
+        segments, _ = model.transcribe(
+            chunk,
+            language="de",
+            initial_prompt=INITIAL_PROMPT,
+            beam_size=5,
+            repetition_penalty=1.2,
+            no_speech_threshold=0.6,
+            condition_on_previous_text=False,
+        )
+
+        for seg in segments:
+            text = seg.text.strip()
+            if not text:
+                continue
+            # Typische Whisper-Halluzinationen auf Minischnipseln / Klicks filtern
+            prompt_words = set(
+                w.strip(",.:;!?").lower() for w in INITIAL_PROMPT.split()
+            )
+            seg_words = [w.strip(",.:;!?").lower() for w in text.split()]
+            is_prompt_echo = (
+                dur < 1.5
+                and len(seg_words) > 0
+                and all(w in prompt_words for w in seg_words)
+            )
+
+            low_text = text.lower()
+            is_subtitle_hallucination = any(
+                h in low_text
+                for h in [
+                    "untertitel",
+                    "sous-titrage",
+                    "radio-canada",
+                    "amara.org",
+                    "zuschauen",
+                    "vielen dank",
+                    "stephanie geiges",
+                ]
+            )
+
+            if is_prompt_echo or (dur < 2.0 and is_subtitle_hallucination):
+                continue
+
+            actual_start = s_sec + seg.start
+            actual_end = min(e_sec + 0.3, s_sec + seg.end)
+            results.append(
+                {
+                    "speaker": speaker_label,
+                    "start": actual_start,
+                    "end": actual_end,
+                    "text": text,
+                }
+            )
+
     return results
+
+
+def merge_speaker_segments(segments, max_gap_sec=2.5):
+    """
+    Fasst aufeinanderfolgende Segmente desselben Sprechers zusammen,
+    solange die Sprechpause <= max_gap_sec beträgt.
+    """
+    if not segments:
+        return []
+    merged = []
+    curr = dict(segments[0])
+
+    for nxt in segments[1:]:
+        same_speaker = nxt["speaker"] == curr["speaker"]
+        gap = nxt["start"] - curr["end"]
+
+        if same_speaker and gap <= max_gap_sec:
+            curr["end"] = max(curr["end"], nxt["end"])
+            curr["text"] += " " + nxt["text"]
+        else:
+            merged.append(curr)
+            curr = dict(nxt)
+    merged.append(curr)
+    return merged
+
 
 def load_speaker_timeline(speakers_path):
     """
@@ -71,18 +166,40 @@ def load_speaker_timeline(speakers_path):
             data = json.load(f)
         return data
     except Exception as e:
-        print(f"[!] Warnung: Konnte Sprecher-Timeline nicht laden: {e}", file=sys.stderr)
+        print(
+            f"[!] Warnung: Konnte Sprecher-Timeline nicht laden: {e}", file=sys.stderr
+        )
         return None
 
-def align_segments_with_timeline(others_segments, timeline_data, min_overlap_ratio=0.35):
+
+def align_segments_with_timeline(
+    others_segments, timeline_data, min_overlap_ratio=0.35
+):
     """
     Matches transcribed Channel 2 segments against the Teams DOM active speaker intervals.
     Replaces generic 'Gegenseite' with real speaker names when there is significant overlap.
+    Unterstützt auch 1:1 Anrufe (wenn timeline_data nur einen Sprecher meldet).
     """
-    if not timeline_data or not timeline_data.get("intervals"):
+    if not timeline_data:
         return others_segments
 
-    intervals = timeline_data["intervals"]
+    speakers = [s.strip() for s in timeline_data.get("speakers", []) if s.strip()]
+    intervals = timeline_data.get("intervals", [])
+
+    # 1:1 Call Heuristik: Wenn genau 1 externer Gesprächspartner bekannt ist,
+    # gehört die gesamte Gegenseite-Spur (Kanal 2 / Loopback) diesem Partner!
+    if len(speakers) == 1:
+        single_speaker = speakers[0]
+        aligned = []
+        for seg in others_segments:
+            new_seg = dict(seg)
+            new_seg["speaker"] = single_speaker
+            new_seg["confidence"] = "teams_1on1_aligned"
+            aligned.append(new_seg)
+        return aligned
+
+    if not intervals:
+        return others_segments
     aligned = []
 
     for seg in others_segments:
@@ -108,7 +225,9 @@ def align_segments_with_timeline(others_segments, timeline_data, min_overlap_rat
             continue
 
         # Sort speakers by overlap descending
-        sorted_speakers = sorted(speaker_overlaps.items(), key=lambda x: x[1], reverse=True)
+        sorted_speakers = sorted(
+            speaker_overlaps.items(), key=lambda x: x[1], reverse=True
+        )
         top_speaker, top_overlap = sorted_speakers[0]
         top_ratio = top_overlap / seg_duration
 
@@ -130,6 +249,7 @@ def align_segments_with_timeline(others_segments, timeline_data, min_overlap_rat
             aligned.append(seg)
 
     return aligned
+
 
 def process_meeting(audio_file_path, output_dir=None, speakers_file_path=None):
     audio_path = Path(audio_file_path)
@@ -157,13 +277,15 @@ def process_meeting(audio_file_path, output_dir=None, speakers_file_path=None):
     if timeline:
         spk_list = timeline.get("speakers", [])
         int_count = len(timeline.get("intervals", []))
-        print(f"[✓] Teams Sprecher-Timeline gefunden ({int_count} Intervalle, Sprecher: {', '.join(spk_list) if spk_list else 'keine'})")
+        print(
+            f"[✓] Teams Sprecher-Timeline gefunden ({int_count} Intervalle, Sprecher: {', '.join(spk_list) if spk_list else 'keine'})"
+        )
 
     print(f"[*] Lese Audio: {audio_path.name}...")
     audio, sr = sf.read(str(audio_path), dtype="float32")
 
-    is_stereo = (audio.ndim == 2 and audio.shape[1] >= 2)
-    
+    is_stereo = audio.ndim == 2 and audio.shape[1] >= 2
+
     print(f"[*] Initialisiere Faster-Whisper (large-v3-turbo) auf GPU...")
     t0 = time.time()
     model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
@@ -173,7 +295,9 @@ def process_meeting(audio_file_path, output_dir=None, speakers_file_path=None):
     total_duration = audio.shape[0] / sr
 
     if is_stereo:
-        print("[✓] Stereo-Signal erkannt: Trenne Kanal 1 (David) und Kanal 2 (Gegenseite/Teams)...")
+        print(
+            "[✓] Stereo-Signal erkannt: Trenne Kanal 1 (David) und Kanal 2 (Gegenseite/Teams)..."
+        )
         # Left channel = David (Mic)
         david_audio = audio[:, 0]
         # Right channel = Others (Loopback)
@@ -182,33 +306,46 @@ def process_meeting(audio_file_path, output_dir=None, speakers_file_path=None):
         t_trans = time.time()
         segs_david = transcribe_channel(model, david_audio, sr, "David")
         segs_others = transcribe_channel(model, others_audio, sr, "Gegenseite")
-        
+
         # Align others with Teams DOM timeline if available
         if timeline:
             print("[*] Gleiche Gegenseite-Segmente mit Teams Sprecher-Timeline ab...")
             segs_others = align_segments_with_timeline(segs_others, timeline)
-            matched_count = sum(1 for s in segs_others if s.get("confidence") == "teams_dom_aligned")
-            print(f"[✓] {matched_count} von {len(segs_others)} Gegenseite-Segmenten erfolgreich konkreten Sprechern zugeordnet.")
+            matched_count = sum(
+                1
+                for s in segs_others
+                if s.get("confidence") in ["teams_dom_aligned", "teams_1on1_aligned"]
+            )
+            print(
+                f"[✓] {matched_count} von {len(segs_others)} Gegenseite-Segmenten erfolgreich konkreten Sprechern zugeordnet."
+            )
 
         all_segments = segs_david + segs_others
         # Sort chronologically by start time
         all_segments.sort(key=lambda x: x["start"])
+        # Merge consecutive segments of same speaker for natural readable paragraphs
+        all_segments = merge_speaker_segments(all_segments)
         trans_duration = time.time() - t_trans
     else:
         print("[!] Mono-Signal erkannt (keine getrennte Spur)...")
         mono_audio = audio[:, 0] if audio.ndim == 2 else audio
         t_trans = time.time()
         all_segments = transcribe_channel(model, mono_audio, sr, "Sprecher")
+        all_segments = merge_speaker_segments(all_segments)
         trans_duration = time.time() - t_trans
 
     speedup = total_duration / max(0.1, trans_duration)
-    print(f"[*] Transkription abgeschlossen in {trans_duration:.2f}s (Speedup: {speedup:.1f}x)")
+    print(
+        f"[*] Transkription abgeschlossen in {trans_duration:.2f}s (Speedup: {speedup:.1f}x)"
+    )
 
     # Build Markdown Output
     meeting_title = audio_path.stem
     lines = []
     lines.append(f"# Meeting Transkript: {meeting_title}")
-    lines.append(f"- **Dauer:** {int(total_duration // 60)}m {int(total_duration % 60)}s ({total_duration:.1f}s)")
+    lines.append(
+        f"- **Dauer:** {int(total_duration // 60)}m {int(total_duration % 60)}s ({total_duration:.1f}s)"
+    )
 
     unique_speakers = []
     seen = set()
@@ -221,13 +358,17 @@ def process_meeting(audio_file_path, output_dir=None, speakers_file_path=None):
     if timeline and len(unique_speakers) > 1:
         lines.append(f"- **Erkannte Sprecher:** {', '.join(unique_speakers)}")
     else:
-        lines.append(f"- **Sprechertrennung:** {'Aktiv (David vs. Gegenseite via Hardware-Tracks)' if is_stereo else 'Mono'}")
+        lines.append(
+            f"- **Sprechertrennung:** {'Aktiv (David vs. Gegenseite via Hardware-Tracks)' if is_stereo else 'Mono'}"
+        )
     lines.append("\n---\n")
 
     for seg in all_segments:
-        time_tag = f"[{format_timestamp(seg['start'])} - {format_timestamp(seg['end'])}]"
-        speaker = seg['speaker']
-        text = seg['text']
+        time_tag = (
+            f"[{format_timestamp(seg['start'])} - {format_timestamp(seg['end'])}]"
+        )
+        speaker = seg["speaker"]
+        text = seg["text"]
 
         if speaker == "David":
             speaker_badge = "**David:**"
@@ -244,28 +385,38 @@ def process_meeting(audio_file_path, output_dir=None, speakers_file_path=None):
 
     json_file = output_dir / f"{meeting_title}_transkript.json"
     with open(json_file, "w", encoding="utf-8") as f:
-        json.dump({
-            "duration": total_duration,
-            "speakers": unique_speakers,
-            "segments": all_segments
-        }, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                "duration": total_duration,
+                "speakers": unique_speakers,
+                "segments": all_segments,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     print(f"[✓] Transkript gespeichert: {md_file}")
-    
+
     # Copy to Windows Clipboard (UTF-16LE required for Windows clip.exe to handle umlauts correctly)
     try:
-        os.system(f'cat "{md_file}" | iconv -f UTF-8 -t UTF-16LE | /mnt/c/Windows/System32/clip.exe')
+        os.system(
+            f'cat "{md_file}" | iconv -f UTF-8 -t UTF-16LE | /mnt/c/Windows/System32/clip.exe'
+        )
         print(f"[✓] Transkript automatisch in die Windows-Zwischenablage kopiert!")
     except Exception as e:
         print(f"Clipboard copy error: {e}")
 
     return md_file
 
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python transcribe_dual.py <path_to_audio_wav> [output_dir] [speakers_json]")
+        print(
+            "Usage: python transcribe_dual.py <path_to_audio_wav> [output_dir] [speakers_json]"
+        )
         sys.exit(1)
-    
+
     audio = sys.argv[1]
     out = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "-" else None
     spk = sys.argv[3] if len(sys.argv) > 3 else None
