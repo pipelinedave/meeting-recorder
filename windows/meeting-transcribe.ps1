@@ -13,6 +13,7 @@ if (-not (Test-Path $OutputDir)) {
 
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $wavFile = Join-Path $OutputDir "Meeting_$timestamp.wav"
+$speakersFile = Join-Path $OutputDir "Meeting_$timestamp.speakers.json"
 
 $cscoreDll = "C:\Users\dhallmann\scripts\CSCore.dll"
 $recorderDll = "C:\Users\dhallmann\scripts\MeetingRecorder.dll"
@@ -31,6 +32,13 @@ Write-Host "`n[*] Starte Dual-Track Audio-Aufnahme..." -ForegroundColor Cyan
 # 'VLegend' selektiert dein Headset-Mikrofon (Poly VLegend 50) und schliesst die Webcam (Poly Studio P5) aus!
 $recorder.Start($wavFile, "VLegend", "VLegend")
 
+# Optionales Teams Active Speaker Tracking im Hintergrund starten
+$wslSpeakers = $speakersFile.Replace('\', '/').Replace('C:', '/mnt/c')
+$trackerJob = Start-Job -ScriptBlock {
+    param($out)
+    wsl -e bash -ilc "node ~/projects/teams-mcp/bin/track-speakers.js record --out '$out'"
+} -ArgumentList $wslSpeakers
+
 Write-Host "`n--------------------------------------------------------" -ForegroundColor Yellow
 Write-Host " [AUFNAHME LAEUFT] " -ForegroundColor Red -NoNewline
 Write-Host "Teams-Ton und Mikrofon werden aufgezeichnet." -ForegroundColor White
@@ -41,6 +49,13 @@ $null = Read-Host
 
 Write-Host "`n[*] Stoppe Aufnahme und finalisiere Audio-Datei..." -ForegroundColor Cyan
 $recorder.Stop()
+
+# Teams Speaker Tracking beenden
+if ($trackerJob) {
+    Stop-Job $trackerJob -ErrorAction SilentlyContinue | Out-Null
+    Remove-Job $trackerJob -ErrorAction SilentlyContinue | Out-Null
+    wsl -e bash -ilc "node ~/projects/teams-mcp/bin/track-speakers.js stop" 2>$null | Out-Null
+}
 
 Write-Host "`n[*] Starte Whisper GPU Transkription und Sprechertrennung..." -ForegroundColor Cyan
 
